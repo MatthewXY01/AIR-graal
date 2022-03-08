@@ -32,7 +32,12 @@ import java.lang.reflect.Executable;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -42,10 +47,28 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import com.oracle.graal.pointsto.BigBang;
+import jdk.vm.ci.meta.JavaKind;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaField;
+import org.graalvm.compiler.core.common.type.ArithmeticStamp;
+import org.graalvm.compiler.core.common.type.Stamp;
 import org.graalvm.compiler.debug.DebugContext;
+import org.graalvm.compiler.graph.NodeInputList;
 import org.graalvm.compiler.java.BytecodeParser.BytecodeParserError;
+import org.graalvm.compiler.nodes.ConstantNode;
+import org.graalvm.compiler.nodes.Invoke;
+import org.graalvm.compiler.nodes.InvokeWithExceptionNode;
+import org.graalvm.compiler.nodes.NodeView;
+import org.graalvm.compiler.nodes.ParameterNode;
+import org.graalvm.compiler.nodes.PiNode;
+import org.graalvm.compiler.nodes.ReturnNode;
 import org.graalvm.compiler.nodes.StructuredGraph;
+import org.graalvm.compiler.nodes.ValueNode;
 import org.graalvm.compiler.nodes.graphbuilderconf.InvocationPlugin;
+import org.graalvm.compiler.nodes.java.LoadFieldNode;
+import org.graalvm.compiler.nodes.java.NewArrayNode;
+import org.graalvm.compiler.nodes.java.NewInstanceNode;
+import org.graalvm.compiler.nodes.java.StoreFieldNode;
 import org.graalvm.util.GuardedAnnotationAccess;
 
 import com.oracle.graal.pointsto.PointsToAnalysis;
@@ -111,6 +134,11 @@ public class AnalysisMethod implements WrappedJavaMethod, GraphProvider, Origina
     private ConcurrentMap<InvokeTypeFlow, Object> invokedBy;
     private ConcurrentMap<InvokeTypeFlow, Object> implementationInvokedBy;
 
+    // #MXY# add result-fields
+    ArgsResult argsResult;
+    FieldResult fieldResult;
+    CallResult callResult;
+    ReturnResult returnResult;
     public AnalysisMethod(AnalysisUniverse universe, ResolvedJavaMethod wrapped) {
         this.universe = universe;
         this.wrapped = wrapped;
@@ -154,6 +182,12 @@ public class AnalysisMethod implements WrappedJavaMethod, GraphProvider, Origina
         typeFlow = new MethodTypeFlow(universe.hostVM().options(), this);
 
         this.qualifiedName = format("%H.%n(%P)");
+
+        // #MXY# init result-fields
+        argsResult = new ArgsResult();
+        fieldResult = new FieldResult();
+        callResult = new CallResult(universe.getOriginalMetaAccess());
+        returnResult = new ReturnResult(universe.getOriginalMetaAccess());
     }
 
     public String getQualifiedName() {
@@ -674,5 +708,389 @@ public class AnalysisMethod implements WrappedJavaMethod, GraphProvider, Origina
 
     public void setAnalyzedGraph(StructuredGraph analyzedGraph) {
         this.analyzedGraph = analyzedGraph;
+    }
+    
+    // #MXY# new version of in-function analysis
+    // --- data structure ---
+    class ParamInfo {
+        int index;
+        Set<String> typeName = new HashSet<>();
+        public ParamInfo(int index, String typeName) {
+            this.index = index;
+            this.typeName.add(typeName);
+        }
+        public void update(String typeName) {
+            this.typeName.add(typeName);
+        }
+    }
+    class ArgsResult {
+        public List<ParamInfo> result = new ArrayList<>();
+        public void update(int index, String typeName){
+            if (!(index < result.size())) {
+                result.add(new ParamInfo(index, typeName));
+            } else {
+                result.get(index).update(typeName);
+            }
+        }
+    }
+    class FieldResult{
+        public Map<String, Set<String>> result = new HashMap<>();
+        public void update(String fieldName, String typeName){
+            if (!result.containsKey(fieldName)) {
+                result.put(fieldName, new HashSet<>());
+            }
+            result.get(fieldName).add(typeName);
+        }
+    }
+    class CallResult {
+        public Map<String, ArgsResult> result = new HashMap<>();
+        public MetaAccessProvider metaAP;
+        public CallResult(MetaAccessProvider metaAP) {
+            this.metaAP = metaAP;
+        }
+        public void update(String methodName, ResolvedJavaMethod method, NodeInputList args){
+            if (!result.containsKey(methodName)) {
+                result.put(methodName, new ArgsResult());
+            } else {
+                assert result.get(methodName).result.size() == args.size();
+            }
+            ArgsResult methodArgs = result.get(methodName);
+            // System.out.println("update " + methodName);
+            for (int i = 0; i< args.size(); i++) {
+                JavaKind jk = method.getSignature().getParameterKind(i);
+                if (jk != JavaKind.Object) {
+                    methodArgs.update(i, jk.getJavaName());
+                    continue;
+                }
+                List<String> valueFieldSeq = new ArrayList<>();
+                ValueNode valueNode = processValue((ValueNode) args.get(i), metaAP, valueFieldSeq);
+//                System.out.println("got root object node");
+                String valueName = "";
+                String joinedValueField = String.join(".", valueFieldSeq);
+                if (valueNode != null) {
+                    if (valueNode instanceof ParameterNode) {
+                        valueName += symblicTypeName((ParameterNode) valueNode, metaAP);
+                    } else {
+                        valueName += valueNode.stamp(NodeView.DEFAULT).javaType((metaAP)).getName();
+                    }
+                    if (!valueFieldSeq.isEmpty()) {
+                        valueName += ".";
+                    }
+                    methodArgs.update(i, valueName + joinedValueField);
+                } else {
+                    methodArgs.update(i, joinedValueField);
+                    // System.out.println(methodName + " arg" + i + " got a static field");
+                }
+            }
+        }
+    }
+    class ReturnResult {
+        public Set<String> result = new HashSet<>();
+        public MetaAccessProvider metaAP;
+        public ReturnResult(MetaAccessProvider metaAP) {
+            this.metaAP = metaAP;
+        }
+        public void update(String typeName) {
+            result.add(typeName);
+        }
+        public void update(ValueNode entryNode){
+            List<String> valueFieldSeq = new ArrayList<>();
+            ValueNode valueNode = processValue(entryNode, metaAP, valueFieldSeq);
+            String valueName = "";
+            String joinedValueField = String.join(".", valueFieldSeq);
+            if (valueNode != null) {
+                if (valueNode instanceof ParameterNode) {
+                    valueName += symblicTypeName((ParameterNode) valueNode, metaAP);
+                } else {
+                    valueName += valueNode.stamp(NodeView.DEFAULT).javaType((metaAP)).getName();
+                }
+                if (!valueFieldSeq.isEmpty()) {
+                    valueName += ".";
+                }
+                result.add(valueName + joinedValueField);
+            } else {
+                result.add(joinedValueField);
+                // System.out.println("return value got a static field");
+            }
+        }
+    }
+
+    // --- functions ---
+    public void doAnalysisGraph(StructuredGraph g) {
+        MetaAccessProvider metaAP = universe.getOriginalMetaAccess();
+
+        // processArgs
+        System.out.println("process args");
+        for (ParameterNode arg: g.getNodes(ParameterNode.TYPE)) {
+            processArgs(argsResult, arg, metaAP);
+        }
+        // processStoreField
+        System.out.println("process storefields");
+        for (StoreFieldNode sfNode: g.getNodes(StoreFieldNode.TYPE)) {
+            processStoreField(fieldResult, sfNode, metaAP);
+        }
+        // processCall
+        System.out.println("process calls");
+        for(Invoke invoke: g.getInvokes()) {
+            processCall(callResult, invoke);
+        }
+        // processReturn
+        System.out.println("process return");
+        JavaKind jk = wrapped.getSignature().getReturnKind().getStackKind();
+        if (jk != JavaKind.Object) {
+            // System.out.println("return javakind is not object");
+            returnResult.update(jk.toString());
+        } else {
+            for (ReturnNode returnNode: g.getNodes(ReturnNode.TYPE)) {
+                ValueNode result = returnNode.result();
+                processReturn(returnResult, result);
+            }
+        }
+        System.out.println("####### finish in-function analysis of " + this.getName());
+    }
+    public String symblicTypeName(ParameterNode argNode, MetaAccessProvider metaAP) {
+        int index = argNode.index();
+        String prefix = "param" + index + "#";
+        return prefix + argNode.stamp(NodeView.DEFAULT).javaType(metaAP).getName();
+    }
+    public void processArgs(ArgsResult argsResult, ParameterNode argNode, MetaAccessProvider metaAP) {
+        int offset = this.isStatic() ? 0 : 1;
+        int index = argNode.index();
+        if (index >= offset) {
+            JavaKind jk = wrapped.getSignature().getParameterKind(index-offset);
+            if (jk != JavaKind.Object) {
+                argsResult.update(index, jk.getJavaName());
+                return;
+            }
+        }
+        String typeName = symblicTypeName(argNode, metaAP);
+        argsResult.update(index, typeName);
+    }
+    public void processStoreField(FieldResult fieldResult, StoreFieldNode sfNode, MetaAccessProvider metaAP) {
+        List<String> recvFieldSeq = new ArrayList<>();
+        List<String> valueFieldSeq = new ArrayList<>();
+        recvFieldSeq.add(sfNode.field().getName());
+        String recvName = "";
+        String valueName = "";
+        ValueNode recvNode = processReceiver(sfNode.object(), metaAP, recvFieldSeq);
+        ValueNode valueNode = processValue(sfNode.value(), metaAP, valueFieldSeq);
+        String joinedRecvField = String.join(".", recvFieldSeq);
+        if (recvNode != null) {
+            if (recvNode instanceof ParameterNode) {
+                recvName += symblicTypeName((ParameterNode) recvNode, metaAP);
+            } else {
+                recvName += recvNode.stamp(NodeView.DEFAULT).javaType(metaAP).getName();
+            }
+            recvName += "." + joinedRecvField;
+        } else {
+            recvName += joinedRecvField;
+            System.out.println("StoreField Receiver: a static field");
+        }
+        String joinedValueField = String.join(".", valueFieldSeq);
+        if (valueNode != null) {
+            if (valueNode instanceof ParameterNode) {
+                valueName += symblicTypeName((ParameterNode) valueNode, metaAP);
+            } else {
+                valueName += valueNode.stamp(NodeView.DEFAULT).javaType((metaAP)).getName();
+            }
+            if (valueFieldSeq.isEmpty()){
+                fieldResult.update(recvName, valueName);
+            } else {  //TODO need to improve
+                fieldResult.update(recvName, valueName + "." + joinedValueField);
+            }
+        } else {
+            fieldResult.update(recvName, joinedValueField);
+            // System.out.println("StoreField Value: a static field");
+        }
+    }
+    public void processCall(CallResult callResult, Invoke invoke) {
+        ResolvedJavaMethod method = invoke.getTargetMethod();
+        String methodName = method.format("%H.%n(%P)");
+        callResult.update(methodName, method, invoke.callTarget().arguments());
+    }
+    public void processReturn(ReturnResult returnResult, ValueNode entryNode) {
+        returnResult.update(entryNode);
+    }
+    public ValueNode processLoadField(LoadFieldNode lfNode, List<String> fieldSeq, MetaAccessProvider metaAP) {
+        ValueNode value = lfNode.object();
+        if (value == null) { // maybe a static field
+            fieldSeq.add(lfNode.field().format("%H.%n"));
+            return null;
+        }
+        String fName = lfNode.field().getName();
+        fieldSeq.add(fName);
+        while(value != null) {
+            if (value instanceof NewInstanceNode || value instanceof NewArrayNode || value instanceof ParameterNode) {
+                return value;
+            }
+            if (value instanceof LoadFieldNode) {
+                return processLoadField((LoadFieldNode) value, fieldSeq, metaAP);
+            }
+            if (value instanceof PiNode) {
+                value  = ((PiNode) value).object();
+                continue;
+            }
+            if (value instanceof InvokeWithExceptionNode) {
+                String methodName = ((InvokeWithExceptionNode) value).methodCallTarget().targetMethod().format("%H.%n(%P)");
+                fieldSeq.add(methodName);
+                Collections.reverse(fieldSeq);
+                return null;
+            }
+            System.out.println("processField Error: unsupported node: " + value.getNodeClass().toString());
+            return null;
+        }
+        System.out.println("got null in processField");
+        return null;
+    }
+    public ValueNode processReceiver(ValueNode entryNode, MetaAccessProvider metaAP, List<String> fieldSeq){
+        ValueNode recvNode = null;
+        while (entryNode != null) {
+            // receiver object is a direct object
+            if (entryNode instanceof NewInstanceNode || entryNode instanceof NewArrayNode || entryNode instanceof ParameterNode) {
+                recvNode = entryNode;
+                return recvNode;
+            }
+            // receiver object is pointed from some o.f
+            if (entryNode instanceof LoadFieldNode) {
+                ResolvedJavaField field = ((LoadFieldNode) entryNode).field();
+                recvNode = processLoadField((LoadFieldNode) entryNode, fieldSeq, metaAP);
+                assert recvNode != null;
+                assert !fieldSeq.isEmpty();
+                Collections.reverse(fieldSeq);
+                return recvNode;
+            }
+            if (entryNode instanceof PiNode) {
+                entryNode = ((PiNode) entryNode).object();
+                continue;
+            }
+            System.out.println("processReceiver Error: unsupported node:  " + entryNode.getNodeClass().toString());
+            return null;
+        }
+        System.out.println("got null in processReceiver");
+        return recvNode;
+    }
+    public ValueNode processValue(ValueNode entryNode, MetaAccessProvider metaAP, List<String> fieldSeq){
+        ValueNode valueNode = null;
+        while (entryNode != null) {
+            // value object is a direct object
+            if (entryNode instanceof ConstantNode || entryNode instanceof NewInstanceNode || entryNode instanceof NewArrayNode || entryNode instanceof ParameterNode) {
+                valueNode = entryNode;
+                return valueNode;
+            }
+            // value object is pointed from some o.f
+            if (entryNode instanceof LoadFieldNode) {
+                ResolvedJavaField field = ((LoadFieldNode) entryNode).field();
+                valueNode = processLoadField((LoadFieldNode) entryNode, fieldSeq, metaAP);
+                // assert valueNode != null;
+                assert !fieldSeq.isEmpty();
+                Collections.reverse(fieldSeq);
+                return valueNode;
+            }
+            if (entryNode instanceof PiNode) {
+                entryNode = ((PiNode) entryNode).object();
+                continue;
+            }
+            if (entryNode instanceof InvokeWithExceptionNode) {
+                String methodName = ((InvokeWithExceptionNode) entryNode).methodCallTarget().targetMethod().format("%H.%n(%P)");
+                fieldSeq.add(methodName);
+                Collections.reverse(fieldSeq);
+                return null;
+            }
+            if (entryNode.stamp(NodeView.DEFAULT) instanceof ArithmeticStamp) { // TODO need to improve
+                String typeName = entryNode.stamp(NodeView.DEFAULT).javaType(metaAP).getName();
+                fieldSeq.add(typeName);
+                Collections.reverse(fieldSeq);
+                return null;
+            }
+            System.out.println("processValue Error: unsupported node: " + entryNode.getNodeClass().toString());
+            return null;
+        }
+        System.out.println("got null when in processValue");
+        return valueNode;
+    }
+
+    // --- compare functions ---
+    public static boolean compare(AnalysisMethod oldFunc, AnalysisMethod newFunc) {
+        // compare args
+        ArgsResult oldArgsResult = oldFunc.argsResult;
+        ArgsResult newArgsResult = newFunc.argsResult;
+        boolean sameArgs = compareArgs(oldArgsResult, newArgsResult);
+        if (!sameArgs) {
+            System.out.println("different in args");
+            // return false;
+        }
+        // compare storeField
+        FieldResult oldFieldResult = oldFunc.fieldResult;
+        FieldResult newFieldResult = newFunc.fieldResult;
+        boolean sameField = compareField(oldFieldResult, newFieldResult);
+        if (!sameField) {
+            System.out.println("different in storefield");
+            // return false;
+        }
+        // compare Call
+        CallResult oldCallResult = oldFunc.callResult;
+        CallResult newCallResult = newFunc.callResult;
+        boolean sameCall = compareCall(oldCallResult, newCallResult);
+        if (!sameCall) {
+            System.out.println("different in call");
+            // return false;
+        }
+        // compare return
+        ReturnResult oldReturnResult = oldFunc.returnResult;
+        ReturnResult newReturnResult = newFunc.returnResult;
+        boolean sameReturn = compareReturn(oldReturnResult, newReturnResult);
+        if (!sameReturn) {
+            System.out.println("difference in return");
+            // return false;
+        }
+        return (sameArgs&&sameField&&sameCall&&sameReturn);
+    }
+    static boolean compareArgs(ArgsResult oldValue, ArgsResult newValue) {
+        List<ParamInfo> oldResult = oldValue.result;
+        List<ParamInfo> newResult = newValue.result;
+        if (oldResult.size()!= newResult.size()) {
+            System.out.println("different args size");
+            return false;
+        }
+        for (int i = 0; i<oldResult.size(); i++) {
+            if (!oldResult.get(i).typeName.equals(newResult.get(i).typeName)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    static boolean compareField(FieldResult oldValue, FieldResult newValue) {
+        Map<String, Set<String>> oldResult = oldValue.result;
+        Map<String, Set<String>> newResult = newValue.result;
+        if (!oldResult.keySet().equals(newResult.keySet())) {
+            System.out.println("different storefield size");
+            return false;
+        }
+        for (String fieldName: newResult.keySet()) {
+            if (!newResult.get(fieldName).equals(oldResult.get(fieldName))) {
+                System.out.println("different storefield value");
+                return false;
+            }
+        }
+        return true;
+    }
+    static boolean compareCall(CallResult oldValue, CallResult newValue) {
+        Map<String, ArgsResult> oldResult = oldValue.result;
+        Map<String, ArgsResult> newResult = newValue.result;
+        if (!oldResult.keySet().equals(newResult.keySet())) {
+            System.out.println("different callees");
+            return false;
+        }
+        for (String methodName: newResult.keySet()) {
+            ArgsResult oldArgsResult = oldResult.get(methodName);
+            ArgsResult newArgsResult = newResult.get(methodName);
+            if (!compareArgs(oldArgsResult, newArgsResult)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    static boolean compareReturn(ReturnResult oldValue, ReturnResult newValue) {
+        return oldValue.result.equals(newValue.result);
     }
 }

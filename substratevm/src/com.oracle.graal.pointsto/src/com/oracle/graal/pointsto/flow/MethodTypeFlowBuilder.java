@@ -170,6 +170,10 @@ public class MethodTypeFlowBuilder {
         }
         graph = InlineBeforeAnalysis.decodeGraph(bb, method, analysisParsedGraph);
 
+        // #MXY# Do analysis for each target method based on the initial graph ir
+        if(this.method.toString().contains("mxy.")) {
+            this.method.doAnalysisGraph(graph);
+        };
         try (DebugContext.Scope s = graph.getDebug().scope("MethodTypeFlowBuilder", graph)) {
             if (!bb.strengthenGraalGraphs()) {
                 /*

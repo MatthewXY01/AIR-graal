@@ -690,6 +690,83 @@ public class NativeImageGenerator {
             }
 
             try (StopTimer t = bb.getAnalysisTimer().start()) {
+                // #MXY# test code for introClassJava benchmark, in debug mode, dynamically add root class and method
+                String myClazzName = ""; // edit it in debug mode, eg. com.mxy.checkSum
+                if (myClazzName != "") {
+                    Class rootType = null;
+                    List<Class> argsOldType = new ArrayList<>();
+                    List<Class> argsNewType = new ArrayList<>();
+                    try {
+                        rootType = loader.forName(myClazzName);
+//                        Class argOldType = loader.forName("com.mxy.A1");
+//                        Class argNewType = loader.forName("com.mxy.A1");
+                        bb.addRootClass(rootType, false, false);
+//                        argsOldType.add(argOldType);
+//                        argsNewType.add(argNewType);
+                    } catch (ClassNotFoundException e) {
+                        e.printStackTrace();
+                    }
+//                    Class[] argsOfOldAnalysisMethod = argsOldType.toArray(new Class[argsOldType.size()]);
+//                    Class[] argsOfNewAnalysisMethod = argsNewType.toArray(new Class[argsNewType.size()]);
+                    if (rootType != null) {
+                        int num = 0; // edit it in debug mode, eg. 11, for the checksum program
+//                        bb.addRootMethod(rootType, "oldfoo", argsOfOldAnalysisMethod);
+//                        bb.addRootMethod(rootType, "newfoo", argsOfNewAnalysisMethod);
+//                        bb.addRootMethod(rootType, "exec1");
+//                        bb.addRootMethod(rootType, "exec2");
+                        for (int i =0; i<num; i++) {
+                            bb.addRootMethod(rootType, "exec"+i);
+                        }
+                    }
+                }
+                boolean wantToCheckReusableInfo = false; // default value "false", reset it when debugging
+                int performedTestNum = 0;
+                if (wantToCheckReusableInfo && performedTestNum==0) { // manually set it true (debug mode) when testing
+                    performedTestNum++;
+                    ArrayList<AnalysisMethod> obArr = new ArrayList<>();
+                    String interestName = "mxy."; // default value "mxy.", reset it when debugging
+                    for (AnalysisMethod aMethod: this.aUniverse.getMethods()) {
+                        if (aMethod.toString().contains(interestName)) {
+                            obArr.add(aMethod);
+                        }
+                    }
+                    obArr.sort(new Comparator<AnalysisMethod>() {
+                        @Override
+                        public int compare(AnalysisMethod o1, AnalysisMethod o2) {
+                            return o1.getId() - o2.getId();
+                        }
+                    });
+                    boolean [][] boolArr = new boolean[obArr.size()][obArr.size()];
+
+                    for(int x = 0; x < obArr.size(); x++) {
+                        for (int y = x; y<obArr.size(); y++) {
+                            boolArr[x][y] = AnalysisMethod.compare(obArr.get(x), obArr.get(y));
+                            boolArr[y][x] = boolArr[x][y];
+                        }
+                    }
+                    int MAX = 1;
+                    for(int x = 0; x < obArr.size(); x++) {
+                        int cnt = 0;
+                        for (int y = 0; y<obArr.size(); y++) {
+                            // System.out.print(boolArr[x][y] + "\t");
+                            if(boolArr[x][y]) {
+                                cnt++;
+                            }
+                        }
+                        if (cnt > MAX) {
+                            MAX=cnt;
+                        }
+                        // System.out.println();
+                    }
+                    System.out.println("maximum of reusability: " + MAX);
+                    for(int x = 0; x < obArr.size(); x++) {
+                        for (int y = 0; y<obArr.size(); y++) {
+                            System.out.print(boolArr[x][y] + "\t");
+                        }
+
+                        System.out.println();
+                    }
+                }
 
                 /*
                  * Iterate until analysis reaches a fixpoint.

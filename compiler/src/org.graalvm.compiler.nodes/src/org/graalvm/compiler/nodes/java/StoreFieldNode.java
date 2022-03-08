@@ -27,6 +27,7 @@ package org.graalvm.compiler.nodes.java;
 import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_8;
 
 import org.graalvm.compiler.core.common.type.StampFactory;
+import org.graalvm.compiler.graph.IterableNodeType;
 import org.graalvm.compiler.graph.Node;
 import org.graalvm.compiler.graph.NodeClass;
 import org.graalvm.compiler.nodes.spi.Canonicalizable;
@@ -50,8 +51,9 @@ import jdk.vm.ci.meta.ResolvedJavaField;
 /**
  * The {@code StoreFieldNode} represents a write to a static or instance field.
  */
+// #MXY# add IterableNodeType
 @NodeInfo(nameTemplate = "StoreField#{p#field/s}")
-public final class StoreFieldNode extends AccessFieldNode implements StateSplit, Virtualizable, Canonicalizable {
+public final class StoreFieldNode extends AccessFieldNode implements StateSplit, Virtualizable, Canonicalizable, IterableNodeType {
     public static final NodeClass<StoreFieldNode> TYPE = NodeClass.create(StoreFieldNode.class);
 
     @Input ValueNode value;
